@@ -127,6 +127,8 @@ Telemetry telemetry;
 Stream *SerialLogger;
 bool hardwareConfigured = true;
 
+// uint8_t found_uid[6] = {0};
+
 #if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
 unsigned long rebootTime = 0;
 extern bool webserverPreventAutoStart;
@@ -187,6 +189,9 @@ bool disableTransmit = true;
 /// PFD Filters ////////////////
 LPF LPF_Offset(2);
 LPF LPF_OffsetDx(4);
+
+bool found_part_uid = false;
+bool found_full_uid = false;
 
 /// LQ/RSSI/SNR Calculation //////////
 LQCALC<100> LQCalc;
@@ -839,13 +844,13 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
 
     if (!didFHSS)
     {
-        HandleFHSS();
+        //HandleFHSS();
     }
     didFHSS = false;
 
     Radio.isFirstRxIrq = true;
     updateDiversity();
-    tlmSent = HandleSendTelemetryResponse();
+    //tlmSent = HandleSendTelemetryResponse();
 
     #if defined(DEBUG_RX_SCOREBOARD)
     static bool lastPacketWasTelemetry = false;
@@ -1073,58 +1078,276 @@ static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode
     }
 }
 
+uint8_t try_uid2 = 0;
+
 static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const * const otaSync)
 {
-    // Verify the first two of three bytes of the binding ID, which should always match
-    if (otaSync->UID3 != UID[3] || otaSync->UID4 != UID[4])
-        return false;
-
-    // The third byte will be XORed with inverse of the ModelId if ModelMatch is on
-    // Only require the first 18 bits of the UID to match to establish a connection
-    // but the last 6 bits must modelmatch before sending any data to the FC
-    if ((otaSync->UID5 & ~MODELMATCH_MASK) != (UID[5] & ~MODELMATCH_MASK))
-        return false;
-
-    LastSyncPacket = now;
-#if defined(DEBUG_RX_SCOREBOARD)
-    DBGW('s');
-#endif
-
-    // Will change the packet air rate in loop() if this changes
-    ExpressLRS_nextAirRateIndex = otaSync->rateIndex;
-    updateSwitchModePendingFromOta(otaSync->switchEncMode);
-
-    // Update TLM ratio, should never be TLM_RATIO_STD/DISARMED, the TX calculates the correct value for the RX
-    expresslrs_tlm_ratio_e TLMrateIn = (expresslrs_tlm_ratio_e)(otaSync->newTlmRatio + (uint8_t)TLM_RATIO_NO_TLM);
-    uint8_t TlmDenom = TLMratioEnumToValue(TLMrateIn);
-    if (ExpressLRS_currTlmDenom != TlmDenom)
-    {
-        DBGLN("New TLMrate 1:%u", TlmDenom);
-        ExpressLRS_currTlmDenom = TlmDenom;
-        telemBurstValid = false;
+    // found_uid[3] = otaSync->UID3;
+    // found_uid[4] = otaSync->UID4;
+    // found_uid[5] = otaSync->UID5;
+    if(!found_part_uid){
+        UID[3] = otaSync->UID3;
+        UID[4] = otaSync->UID4;
+        UID[5] = otaSync->UID5;
     }
+    
+    // if(found_part_uid){
 
-    // modelId = 0xff indicates modelMatch is disabled, the XOR does nothing in that case
-    uint8_t modelXor = (~config.GetModelId()) & MODELMATCH_MASK;
-    bool modelMatched = otaSync->UID5 == (UID[5] ^ modelXor);
-    DBGVLN("MM %u=%u %d", otaSync->UID5, UID[5], modelMatched);
+    //     DBGLN("FOUND UID parts: %d %d %d", UID[3], UID[4], UID[5]);
+    // }
 
-    if (connectionState == disconnected
-        || OtaNonce != otaSync->nonce
-        || FHSSgetCurrIndex() != otaSync->fhssIndex
-        || connectionHasModelMatch != modelMatched)
-    {
-        //DBGLN("\r\n%ux%ux%u", OtaNonce, otaPktPtr->sync.nonce, otaPktPtr->sync.fhssIndex);
-        FHSSsetCurrIndex(otaSync->fhssIndex);
-        OtaNonce = otaSync->nonce;
-        TentativeConnection(now);
-        // connectionHasModelMatch must come after TentativeConnection, which resets it
-        connectionHasModelMatch = modelMatched;
-        return true;
-    }
+//     // Verify the first two of three bytes of the binding ID, which should always match
+//     if (otaSync->UID3 != UID[3] || otaSync->UID4 != UID[4])
+//         return false;
+
+//     // The third byte will be XORed with inverse of the ModelId if ModelMatch is on
+//     // Only require the first 18 bits of the UID to match to establish a connection
+//     // but the last 6 bits must modelmatch before sending any data to the FC
+//     if ((otaSync->UID5 & ~MODELMATCH_MASK) != (UID[5] & ~MODELMATCH_MASK))
+//         return false;
+
+//     LastSyncPacket = now;
+// #if defined(DEBUG_RX_SCOREBOARD)
+//     DBGW('s');
+// #endif
+
+//     // Will change the packet air rate in loop() if this changes
+//     ExpressLRS_nextAirRateIndex = otaSync->rateIndex;
+//     updateSwitchModePendingFromOta(otaSync->switchEncMode);
+
+//     // Update TLM ratio, should never be TLM_RATIO_STD/DISARMED, the TX calculates the correct value for the RX
+//     expresslrs_tlm_ratio_e TLMrateIn = (expresslrs_tlm_ratio_e)(otaSync->newTlmRatio + (uint8_t)TLM_RATIO_NO_TLM);
+//     uint8_t TlmDenom = TLMratioEnumToValue(TLMrateIn);
+//     if (ExpressLRS_currTlmDenom != TlmDenom)
+//     {
+//         DBGLN("New TLMrate 1:%u", TlmDenom);
+//         ExpressLRS_currTlmDenom = TlmDenom;
+//         telemBurstValid = false;
+//     }
+
+//     // modelId = 0xff indicates modelMatch is disabled, the XOR does nothing in that case
+//     uint8_t modelXor = (~config.GetModelId()) & MODELMATCH_MASK;
+//     bool modelMatched = otaSync->UID5 == (UID[5] ^ modelXor);
+//     DBGVLN("MM %u=%u %d", otaSync->UID5, UID[5], modelMatched);
+
+//     if (connectionState == disconnected
+//         || OtaNonce != otaSync->nonce
+//         || FHSSgetCurrIndex() != otaSync->fhssIndex
+//         || connectionHasModelMatch != modelMatched)
+//     {
+//         try_uid2++;
+//         UID[2] = try_uid2;
+//         FHSSrandomiseFHSSsequence(uidMacSeedGet());
+//         DBGLN("Trying UID: %d %d %d %d", UID[2], UID[3], UID[4], UID[5]);
+//         DBGLN("Reason disconnected %d OtaNonce: %d fhssIndex: %d", connectionState == disconnected, OtaNonce != otaSync->nonce, FHSSgetCurrIndex() != otaSync->fhssIndex);
+//         DBGLN("Got OtaNonce: %d Expected %d; got fhssIndex: %d expected %d", otaSync->nonce, OtaNonce, otaSync->fhssIndex, FHSSgetCurrIndex());
+
+//         //DBGLN("\r\n%ux%ux%u", OtaNonce, otaPktPtr->sync.nonce, otaPktPtr->sync.fhssIndex);
+//         FHSSsetCurrIndex(otaSync->fhssIndex);
+//         OtaNonce = otaSync->nonce;
+//         TentativeConnection(now);
+//         // connectionHasModelMatch must come after TentativeConnection, which resets it
+//         connectionHasModelMatch = modelMatched;
+//         return true;
+
+
+//     }
 
     return false;
 }
+
+uint8_t sniffing_state = 0; // 0 = listening for syn, 1 = listening for rc
+uint32_t last_syn;
+
+struct point {
+    uint8_t x;
+    uint8_t y;
+};
+
+struct point point;
+
+struct point points[3];
+
+uint8_t found_points = 0;
+uint8_t last_index = 0;
+uint8_t last_nonce = 0;
+
+static inline uint32_t getActiveFreqCount()
+{
+    if (!FHSSusePrimaryFreqBand && FHSSconfigDualBand != nullptr)
+    {
+        return FHSSconfigDualBand->freq_count;
+    }
+    return FHSSconfig != nullptr ? FHSSconfig->freq_count : 0;
+}
+
+static inline uint_fast8_t getActiveSyncChannel()
+{
+    if (!FHSSusePrimaryFreqBand && FHSSconfigDualBand != nullptr)
+    {
+        return sync_channel_DualBand;
+    }
+    return sync_channel;
+}
+
+static uint16_t rngFromSeed(uint32_t &seed)
+{
+    const uint32_t a = 214013UL;
+    const uint32_t c = 2531011UL;
+    seed = (uint32_t)(((uint64_t)a * seed + c) & 0x7FFFFFFFUL);
+    return seed >> 16;
+}
+
+static uint8_t rngNFromSeed(uint32_t &seed, uint8_t max)
+{
+    if (max == 0)
+    {
+        return 0;
+    }
+    return rngFromSeed(seed) % max;
+}
+
+static void buildSequenceForSeed(uint32_t seed, uint32_t freqCount, uint_fast8_t syncChannel, uint16_t sequenceCount, uint8_t *sequenceOut)
+{
+    if ((sequenceOut == nullptr) || freqCount == 0 || sequenceCount == 0)
+    {
+        return;
+    }
+
+    for (uint16_t i = 0; i < sequenceCount; i++)
+    {
+        uint32_t posInBlock = i % freqCount;
+        if (posInBlock == 0)
+        {
+            sequenceOut[i] = syncChannel;
+        }
+        else if (posInBlock == syncChannel)
+        {
+            sequenceOut[i] = 0;
+        }
+        else
+        {
+            sequenceOut[i] = posInBlock;
+        }
+    }
+
+    if (freqCount <= 1)
+    {
+        return;
+    }
+
+    uint32_t localSeed = seed;
+
+    for (uint16_t i = 0; i < sequenceCount; i++)
+    {
+        if (i % freqCount == 0)
+        {
+            continue;
+        }
+        uint16_t blockOffset = (i / freqCount) * freqCount;
+        uint8_t randIndex = rngNFromSeed(localSeed, freqCount - 1) + 1;
+        uint8_t swapIndex = blockOffset + randIndex;
+        uint8_t temp = sequenceOut[i];
+        sequenceOut[i] = sequenceOut[swapIndex];
+        sequenceOut[swapIndex] = temp;
+    }
+}
+
+static int16_t distanceFromSyncToChannel(const uint8_t *sequence, uint16_t sequenceCount, uint16_t startIndex, uint8_t targetChannel)
+{
+    if (sequenceCount == 0)
+    {
+        return -1;
+    }
+
+    uint16_t index = startIndex % sequenceCount;
+
+    for (uint16_t step = 0; step < sequenceCount; step++)
+    {
+        index = (index + 1) % sequenceCount;
+        if (sequence[index] == targetChannel)
+        {
+            return (int16_t)step;
+        }
+    }
+
+    return -1;
+}
+
+static bool sequenceMatchesPoints(const uint8_t *sequence, uint16_t sequenceCount, uint_fast8_t syncChannel)
+{
+    if (sequenceCount == 0)
+    {
+        return false;
+    }
+
+    const uint16_t referenceIndex = 7 % sequenceCount;
+    const uint8_t referenceChannel = sequence[referenceIndex];
+
+    for (uint8_t idx = 0; idx < found_points; idx++)
+    {
+        uint16_t startIndex = points[idx].x % sequenceCount;
+
+        if (sequence[startIndex] != syncChannel)
+        {
+            return false;
+        }
+
+        int16_t distance = distanceFromSyncToChannel(sequence, sequenceCount, startIndex, referenceChannel);
+        if (distance < 0 || (uint8_t)distance != points[idx].y)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool recoverUidFromCapturedPoints()
+{
+    if (!found_part_uid)
+    {
+        DBGLN("Cannot recover UID seed without valid UID tail");
+        return false;
+    }
+
+    const uint32_t freqCount = getActiveFreqCount();
+    const uint_fast8_t activeSyncChannel = getActiveSyncChannel();
+    const uint16_t sequenceCount = FHSSgetSequenceCount();
+
+    if (freqCount == 0 || sequenceCount == 0)
+    {
+        DBGLN("FHSS config incomplete, cannot brute force UID seed");
+        return false;
+    }
+
+    uint8_t candidateSequence[FHSS_SEQUENCE_LEN] = {0};
+
+    for (uint16_t candidate = 0; candidate < 256; candidate++)
+    {
+        uint32_t candidateSeed = ((uint32_t)candidate << 24) + ((uint32_t)UID[3] << 16) +
+                                 ((uint32_t)UID[4] << 8) + (UID[5] ^ OTA_VERSION_ID);
+
+        buildSequenceForSeed(candidateSeed, freqCount, activeSyncChannel, sequenceCount, candidateSequence);
+
+        if (!sequenceMatchesPoints(candidateSequence, sequenceCount, activeSyncChannel))
+        {
+            continue;
+        }
+
+        UID[2] = (uint8_t)candidate;
+        uint32_t recoveredSeed = uidMacSeedGet();
+
+        DBGLN("Recovered uidMacSeed: %u", recoveredSeed);
+        DBGLN("Recovered UID bytes: %u %u %u %u", UID[2], UID[3], UID[4], UID[5]);
+        return true;
+    }
+
+    DBGLN("Failed to match captured FHSS points to any UID seed");
+    return false;
+}
+
+
 
 bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
 {
@@ -1136,73 +1359,138 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
         #endif
         return false;
     }
+
     uint32_t const beginProcessing = micros();
+    uint32_t const now = millis();
 
     OTA_Packet_s * const otaPktPtr = (OTA_Packet_s * const)Radio.RXdataBuffer;
-    if (!OtaValidatePacketCrc(otaPktPtr))
+
+
+    if (found_part_uid && !OtaValidatePacketCrc(otaPktPtr))
     {
-        DBGVLN("CRC error");
+        //DBGVLN("CRC error");
         #if defined(DEBUG_RX_SCOREBOARD)
             lastPacketCrcError = true;
         #endif
         return false;
     }
 
-    PFDloop.extEvent(beginProcessing + PACKET_TO_TOCK_SLACK);
+    if(found_part_uid){
+        //DBGVLN("Got packet of type: %d, sniffing state: %d, FHSS index: %d", otaPktPtr->std.type, sniffing_state, FHSSgetCurrIndex());
+    }
+    // if(FHSSonSyncChannel()){
+    //     DBGLN("On sync");
+    // }
 
-    doStartTimer = false;
-    unsigned long now = millis();
+    
 
-    LastValidPacket = now;
-
-    switch (otaPktPtr->std.type)
-    {
-    case PACKET_TYPE_RCDATA: //Standard RC Data Packet
-        ProcessRfPacket_RC(otaPktPtr);
-        break;
-    case PACKET_TYPE_MSPDATA:
-        ProcessRfPacket_MSP(otaPktPtr);
-        break;
-    case PACKET_TYPE_SYNC: //sync packet from master
-        doStartTimer = ProcessRfPacket_SYNC(now,
-            OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync)
-            && !InBindingMode;
-        break;
-    case PACKET_TYPE_TLM:
-        if (firmwareOptions.is_airport)
-        {
-            OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
+    if(sniffing_state == 0 && otaPktPtr->std.type == PACKET_TYPE_SYNC){
+        //DBGLN("Got syn, is on syn? %d", FHSSonSyncChannel());
+        if(FHSSonSyncChannel()){
+            ProcessRfPacket_SYNC(now, OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync);
+            OtaUpdateCrcInitFromUid();
+            //DBGLN("Updated crc");
+            
+            if(OtaValidatePacketCrc(otaPktPtr)){
+                FHSSsetCurrIndex(6);
+                Radio.SetFrequencyReg(FHSSgetNextFreq());
+                last_syn = now;
+                sniffing_state = 1;
+                if(!found_part_uid){
+                     DBGLN("FOUND UID parts: %d %d %d", UID[3], UID[4], UID[5]);
+                     DBGLN("GOT correct CRC!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                     found_part_uid = true;
+                }
+                DBGLN("FHSS index: %d, nonce: %d", otaPktPtr->std.sync.fhssIndex, otaPktPtr->std.sync.nonce % 4);
+                last_index = otaPktPtr->std.sync.fhssIndex;
+                last_nonce = otaPktPtr->std.sync.nonce % 4;
+            }
         }
-        break;
-    default:
-        break;
+    }
+    else if(sniffing_state == 1){
+        DBGLN("Time diff: %d", (uint32) now - last_syn);
+        sniffing_state = 0;
+        FHSSsetCurrIndex(246); // Syn channel
+        Radio.SetFrequencyReg(FHSSgetNextFreq());
+        //Radio.SetFrequencyReg(FHSSgetInitialFreq());
+        points[found_points].x = last_index;
+        points[found_points].y = (uint8_t)(((((uint32_t)(now - last_syn)) - ((4 - last_nonce) * 10)) / 40));
+        found_points++;
+        if(found_points == 3){
+            sniffing_state = 3;
+
+            if (!found_full_uid)
+            {
+                found_full_uid = recoverUidFromCapturedPoints();
+            }
+
+            found_points = 0;
+            sniffing_state = 0;
+
+        }
     }
 
-    // Store the LQ/RSSI/Antenna
-    Radio.GetLastPacketStats();
-    getRFlinkInfo();
 
-    if (Radio.FrequencyErrorAvailable())
-    {
-    #if defined(RADIO_SX127X)
-        int32_t tempFreqCorrection = HandleFreqCorr(Radio.GetFrequencyErrorbool());      // Adjusts FreqCorrection for RX freq offset
-        // Teamp900 also needs to adjust its demood PPM
-        Radio.SetPPMoffsetReg(tempFreqCorrection);
-    #endif /* RADIO_SX127X */
-    }
 
-    // Received a packet, that's the definition of LQ
-    LQCalc.add();
-    // Extend sync duration since we've received a packet at this rate
-    // but do not extend it indefinitely
-    RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
+//     PFDloop.extEvent(beginProcessing + PACKET_TO_TOCK_SLACK);
 
-#if defined(DEBUG_RX_SCOREBOARD)
-    if (otaPktPtr->std.type != PACKET_TYPE_SYNC) DBGW(connectionHasModelMatch ? 'R' : 'r');
-#endif
+//     doStartTimer = false;
+//     unsigned long now = millis();
+
+//     LastValidPacket = now;
+
+//     switch (otaPktPtr->std.type)
+//     {
+//     case PACKET_TYPE_RCDATA: //Standard RC Data Packet
+//         ProcessRfPacket_RC(otaPktPtr);
+//         break;
+//     case PACKET_TYPE_MSPDATA:
+//         ProcessRfPacket_MSP(otaPktPtr);
+//         break;
+//     case PACKET_TYPE_SYNC: //sync packet from master
+//         doStartTimer = ProcessRfPacket_SYNC(now,
+//             OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync)
+//             && !InBindingMode;
+//         break;
+//     case PACKET_TYPE_TLM:
+//         if (firmwareOptions.is_airport)
+//         {
+//             OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
+//         }
+//         break;
+//     default:
+//         break;
+//     }
+
+//     // Store the LQ/RSSI/Antenna
+//     Radio.GetLastPacketStats();
+//     getRFlinkInfo();
+
+//     if (Radio.FrequencyErrorAvailable())
+//     {
+//     #if defined(RADIO_SX127X)
+//         int32_t tempFreqCorrection = HandleFreqCorr(Radio.GetFrequencyErrorbool());      // Adjusts FreqCorrection for RX freq offset
+//         // Teamp900 also needs to adjust its demood PPM
+//         Radio.SetPPMoffsetReg(tempFreqCorrection);
+//     #endif /* RADIO_SX127X */
+//     }
+
+//     // Received a packet, that's the definition of LQ
+//     LQCalc.add();
+//     // Extend sync duration since we've received a packet at this rate
+//     // but do not extend it indefinitely
+//     RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
+
+// #if defined(DEBUG_RX_SCOREBOARD)
+//     if (otaPktPtr->std.type != PACKET_TYPE_SYNC) DBGW(connectionHasModelMatch ? 'R' : 'r');
+// #endif
 
     return true;
 }
+
+
+
+
 
 bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 {
@@ -1213,13 +1501,13 @@ bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 
     if (ProcessRFPacket(status))
     {
-        didFHSS = HandleFHSS();
+        // didFHSS = HandleFHSS();
 
-        if (doStartTimer)
-        {
-            doStartTimer = false;
-            hwTimer::resume(); // will throw an interrupt immediately
-        }
+        // if (doStartTimer)
+        // {
+        //     doStartTimer = false;
+        //     hwTimer::resume(); // will throw an interrupt immediately
+        // }
 
         return true;
     }
@@ -1702,16 +1990,18 @@ static void setupRadio()
     Radio.RXdoneCallback = &RXdoneISR;
     Radio.TXdoneCallback = &TXdoneISR;
 
-    scanIndex = config.GetRateInitialIdx();
-    for (int i=0 ; i<RATE_MAX ; i++)
-    {
-        if (isSupportedRFRate(scanIndex))
-        {
-            break;
-        }
-        scanIndex = (scanIndex + 1) % RATE_MAX;
-    }
-    SetRFLinkRate(scanIndex, false);
+    scanIndex = 2;
+    // scanIndex = config.GetRateInitialIdx();
+    // for (int i=0 ; i<RATE_MAX ; i++)
+    // {
+    //     if (isSupportedRFRate(scanIndex))
+    //     {
+    //         break;
+    //     }
+    //     scanIndex = (scanIndex + 1) % RATE_MAX;
+    // }
+    // SetRFLinkRate(scanIndex, false);
+    SetRFLinkRate(2, false);
     // Start slow on the selected rate to give it the best chance
     // to connect before beginning rate cycling
     RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow / 2;
@@ -1747,20 +2037,21 @@ static void cycleRfMode(unsigned long now)
         SetRFLinkRate(scanIndex % RATE_MAX, false); // switch between rates
         LQCalc.reset100();
         LQCalcDVDA.reset100();
-        // Display the current air rate to the user as an indicator something is happening
-        scanIndex++;
+        // // Display the current air rate to the user as an indicator something is happening
+        // scanIndex++;
         Radio.RXnb();
         DBGLN("%u", ExpressLRS_currAirRate_Modparams->interval);
+        DBGLN("Scan index: %u", scanIndex);
 
-        // Skip unsupported modes for hardware with only a single LR1121 or with a single RF path
-        while (!isSupportedRFRate(scanIndex % RATE_MAX))
-        {
-            DBGLN("Skip %u", get_elrs_airRateConfig(scanIndex % RATE_MAX)->interval);
-            scanIndex++;
-        }
+        // // Skip unsupported modes for hardware with only a single LR1121 or with a single RF path
+        // while (!isSupportedRFRate(scanIndex % RATE_MAX))
+        // {
+        //     DBGLN("Skip %u", get_elrs_airRateConfig(scanIndex % RATE_MAX)->interval);
+        //     scanIndex++;
+        // }
 
-        // Switch to FAST_SYNC if not already in it (won't be if was just connected)
-        RFmodeCycleMultiplier = 1;
+        // // Switch to FAST_SYNC if not already in it (won't be if was just connected)
+        // RFmodeCycleMultiplier = 1;
     } // if time to switch RF mode
 }
 
@@ -2189,95 +2480,103 @@ void loop()
 {
     unsigned long now = millis();
 
-    if (MspReceiver.HasFinishedData())
-    {
-        MspReceiveComplete();
-    }
+    // if (MspReceiver.HasFinishedData())
+    // {
+    //     MspReceiveComplete();
+    // }
 
-    devicesUpdate(now);
+    //devicesUpdate(now);
 
     // read and process any data from serial ports, send any queued non-RC data
     handleSerialIO();
 
-#if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
-    // If the reboot time is set and the current time is past the reboot time then reboot.
-    if (rebootTime != 0 && now > rebootTime) {
-        ESP.restart();
-    }
-    #endif
+// #if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
+//     // If the reboot time is set and the current time is past the reboot time then reboot.
+//     if (rebootTime != 0 && now > rebootTime) {
+//         ESP.restart();
+//     }
+//     #endif
 
-    CheckConfigChangePending();
+    //CheckConfigChangePending();
     executeDeferredFunction(micros());
 
-    if (connectionState > MODE_STATES)
-    {
-        return;
-    }
+    //cycleRfMode(now);
+    Radio.RXnb();
 
-    if ((connectionState != disconnected) && (ExpressLRS_currAirRate_Modparams->index != ExpressLRS_nextAirRateIndex)) // forced change
-    {
-        DBGLN("Req air rate change %u->%u", ExpressLRS_currAirRate_Modparams->index, ExpressLRS_nextAirRateIndex);
-        if (!isSupportedRFRate(ExpressLRS_nextAirRateIndex))
-        {
-            DBGLN("Mode %u not supported, ignoring", ExpressLRS_nextAirRateIndex);
-            ExpressLRS_nextAirRateIndex = ExpressLRS_currAirRate_Modparams->index;
-        }
-        LostConnection(true);
-        LastSyncPacket = now;           // reset this variable to stop rf mode switching and add extra time
-        RFmodeLastCycled = now;         // reset this variable to stop rf mode switching and add extra time
-        SendLinkStatstoFCintervalLastSent = 0;
-        SendLinkStatstoFCForcedSends = 2;
-    }
 
-    if (connectionState == tentative && (now - LastSyncPacket > ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs))
-    {
-        DBGLN("Bad sync, aborting");
-        LostConnection(true);
-        RFmodeLastCycled = now;
-        LastSyncPacket = now;
-    }
 
-    cycleRfMode(now);
 
-    uint32_t localLastValidPacket = LastValidPacket; // Required to prevent race condition due to LastValidPacket getting updated from ISR
-    if ((connectionState == connected) && ((int32_t)ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs < (int32_t)(now - localLastValidPacket))) // check if we lost conn.
-    {
-        LostConnection(true);
-    }
+//     if (connectionState > MODE_STATES)
+//     {
+//         return;
+//     }
 
-    if ((connectionState == tentative) && (abs(LPF_OffsetDx.value()) <= 10) && (LPF_Offset.value() < 100) && (LQCalc.getLQRaw() > minLqForChaos())) //detects when we are connected
-    {
-        GotConnection(now);
-    }
+//     if ((connectionState != disconnected) && (ExpressLRS_currAirRate_Modparams->index != ExpressLRS_nextAirRateIndex)) // forced change
+//     {
+//         DBGLN("Req air rate change %u->%u", ExpressLRS_currAirRate_Modparams->index, ExpressLRS_nextAirRateIndex);
+//         if (!isSupportedRFRate(ExpressLRS_nextAirRateIndex))
+//         {
+//             DBGLN("Mode %u not supported, ignoring", ExpressLRS_nextAirRateIndex);
+//             ExpressLRS_nextAirRateIndex = ExpressLRS_currAirRate_Modparams->index;
+//         }
+//         LostConnection(true);
+//         LastSyncPacket = now;           // reset this variable to stop rf mode switching and add extra time
+//         RFmodeLastCycled = now;         // reset this variable to stop rf mode switching and add extra time
+//         SendLinkStatstoFCintervalLastSent = 0;
+//         SendLinkStatstoFCForcedSends = 2;
+//     }
 
-    checkSendLinkStatsToFc(now);
+//     // if (connectionState == tentative && (now - LastSyncPacket > ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs))
+//     // {
+//     //     // DBGLN("Bad sync, aborting");
+//     //     // LostConnection(true);
+//     //     // RFmodeLastCycled = now;
+//     //     // LastSyncPacket = now;
+//     //     // DBGLN("Trying new uid");
+//     //     // try_uid2++;
+//     // }
 
-    if ((RXtimerState == tim_tentative) && ((now - GotConnectionMillis) > ConsiderConnGoodMillis) && (abs(LPF_OffsetDx.value()) <= 5))
-    {
-        RXtimerState = tim_locked;
-        DBGLN("Timer locked");
-    }
+//     cycleRfMode(now);
 
-    uint8_t nextPlayloadSize = 0;
-    if (!TelemetrySender.IsActive() && telemetry.GetNextPayload(&nextPlayloadSize, currentTelemetryPayload))
-    {
-        TelemetrySender.SetDataToTransmit(currentTelemetryPayload, nextPlayloadSize);
-    }
+//     uint32_t localLastValidPacket = LastValidPacket; // Required to prevent race condition due to LastValidPacket getting updated from ISR
+//     if ((connectionState == connected) && ((int32_t)ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs < (int32_t)(now - localLastValidPacket))) // check if we lost conn.
+//     {
+//         LostConnection(true);
+//     }
 
-#if !defined(PLATFORM_STM32)
-    if (config.GetSerialProtocol() == PROTOCOL_MAVLINK && !TelemetrySender.IsActive() && ((SerialMavlink *)serialIO)->GetNextPayload(&nextPlayloadSize, currentTelemetryPayload))
-    {
-        TelemetrySender.SetDataToTransmit(currentTelemetryPayload, nextPlayloadSize);
-    }
-#endif
+//     if ((connectionState == tentative) && (abs(LPF_OffsetDx.value()) <= 10) && (LPF_Offset.value() < 100) && (LQCalc.getLQRaw() > minLqForChaos())) //detects when we are connected
+//     {
+//         GotConnection(now);
+//     }
 
-    updateTelemetryBurst();
-    updateBindingMode(now);
-    updateSwitchMode();
-    checkGeminiMode();
-    DynamicPower_UpdateRx(false);
-    debugRcvrLinkstats();
-    debugRcvrSignalStats(now);
+//     checkSendLinkStatsToFc(now);
+
+//     if ((RXtimerState == tim_tentative) && ((now - GotConnectionMillis) > ConsiderConnGoodMillis) && (abs(LPF_OffsetDx.value()) <= 5))
+//     {
+//         RXtimerState = tim_locked;
+//         DBGLN("Timer locked");
+//     }
+
+//     uint8_t nextPlayloadSize = 0;
+//     if (!TelemetrySender.IsActive() && telemetry.GetNextPayload(&nextPlayloadSize, currentTelemetryPayload))
+//     {
+//         TelemetrySender.SetDataToTransmit(currentTelemetryPayload, nextPlayloadSize);
+//     }
+
+// #if !defined(PLATFORM_STM32)
+//     if (config.GetSerialProtocol() == PROTOCOL_MAVLINK && !TelemetrySender.IsActive() && ((SerialMavlink *)serialIO)->GetNextPayload(&nextPlayloadSize, currentTelemetryPayload))
+//     {
+//         TelemetrySender.SetDataToTransmit(currentTelemetryPayload, nextPlayloadSize);
+//     }
+// #endif
+
+//     updateTelemetryBurst();
+//     updateBindingMode(now);
+//     updateSwitchMode();
+//     checkGeminiMode();
+//     DynamicPower_UpdateRx(false);
+//     debugRcvrLinkstats();
+//     debugRcvrSignalStats(now);
 }
 
 #if defined(PLATFORM_ESP32_C3)
