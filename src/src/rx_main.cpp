@@ -1400,6 +1400,19 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
                      DBGLN("FOUND UID parts: %d %d %d", UID[3], UID[4], UID[5]);
                      DBGLN("GOT correct CRC!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                      found_part_uid = true;
+
+                    OTA_Sync_s const * const syncPkt = OtaIsFullRes ? &otaPktPtr->full.sync.sync
+                                                                   : &otaPktPtr->std.sync;
+                    DBGLN("Sync fields fhss=%u nonce=%u switchEnc=%u tlmRatio=%u rateIdx=%u UID=%u,%u,%u",
+                          syncPkt->fhssIndex,
+                          syncPkt->nonce,
+                          syncPkt->switchEncMode,
+                          syncPkt->newTlmRatio,
+                          syncPkt->rateIndex,
+                          syncPkt->UID3,
+                          syncPkt->UID4,
+                          syncPkt->UID5);
+
                 }
                 DBGLN("FHSS index: %d, nonce: %d", otaPktPtr->std.sync.fhssIndex, otaPktPtr->std.sync.nonce % 4);
                 last_index = otaPktPtr->std.sync.fhssIndex;
