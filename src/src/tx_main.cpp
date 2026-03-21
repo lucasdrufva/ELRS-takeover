@@ -8,6 +8,7 @@
 #include "telemetry_protocol.h"
 #include "stubborn_receiver.h"
 #include "stubborn_sender.h"
+#include "tx_takeover.h"
 
 #include "devHandset.h"
 #include "devADC.h"
@@ -91,7 +92,7 @@ static uint16_t ptrChannelData[3] = {CRSF_CHANNEL_VALUE_MID, CRSF_CHANNEL_VALUE_
 static uint32_t lastPTRValidTimeMs;
 #endif
 
-static TxTlmRcvPhase_e TelemetryRcvPhase = ttrpTransmitting;
+TxTlmRcvPhase_e TelemetryRcvPhase = ttrpTransmitting;
 StubbornReceiver TelemetryReceiver;
 StubbornSender MspSender;
 uint8_t CRSFinBuffer[CRSF_MAX_PACKET_LEN+1];
@@ -561,12 +562,23 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
     (isTlmDisarmed && handset->IsArmed() && (ExpressLRS_currTlmDenom == 1));
 
   uint8_t NonceFHSSresult = OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
+  OTA_Sync_s *syncPacket = OtaIsFullRes ? &otaPkt.full.sync.sync : &otaPkt.std.sync;
+  bool forceTakeoverSync = TxTakeover::ShouldForceSync();
 
-  // Sync spam only happens on slot 1 and 2 and can't be disabled
-  if ((syncSpamCounter || (syncSpamCounterAfterRateChange && FHSSonSyncChannel())) && (NonceFHSSresult == 1 || NonceFHSSresult == 2))
+  if (forceTakeoverSync)
   {
     otaPkt.std.type = PACKET_TYPE_SYNC;
-    GenerateSyncPacketData(OtaIsFullRes ? &otaPkt.full.sync.sync : &otaPkt.std.sync);
+    GenerateSyncPacketData(syncPacket);
+    TxTakeover::OverrideSyncFields(syncPacket, true);
+    TxTakeover::OnForcedSyncQueued();
+    syncSlot = 0;
+  }
+  // Sync spam only happens on slot 1 and 2 and can't be disabled
+  else if ((syncSpamCounter || (syncSpamCounterAfterRateChange && FHSSonSyncChannel())) && (NonceFHSSresult == 1 || NonceFHSSresult == 2))
+  {
+    otaPkt.std.type = PACKET_TYPE_SYNC;
+    GenerateSyncPacketData(syncPacket);
+    TxTakeover::OverrideSyncFields(syncPacket, false);
     syncSlot = 0; // reset the sync slot in case the new rate (after the syncspam) has a lower FHSShopInterval
   }
   // Regular sync rotates through 4x slots, twice on each slot, and telemetry pushes it to the next slot up
@@ -574,7 +586,8 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
   else if ((!skipSync) && ((syncSlot / 2) <= NonceFHSSresult) && (now - SyncPacketLastSent > SyncInterval) && FHSSonSyncChannel())
   {
     otaPkt.std.type = PACKET_TYPE_SYNC;
-    GenerateSyncPacketData(OtaIsFullRes ? &otaPkt.full.sync.sync : &otaPkt.std.sync);
+    GenerateSyncPacketData(syncPacket);
+    TxTakeover::OverrideSyncFields(syncPacket, false);
     syncSlot = (syncSlot + 1) % (ExpressLRS_currAirRate_Modparams->FHSShopInterval * 2);
   }
   else
@@ -709,6 +722,12 @@ void ICACHE_RAM_ATTR timerCallback()
   // Nonce advances on every timer tick
   if (!InBindingMode)
     OtaNonce++;
+
+  if (TxTakeover::OnTimerPostNonceAdvance())
+  {
+    TelemetryRcvPhase = ttrpTransmitting;
+    return;
+  }
 
   // If HandleTLM has started Receive mode, TLM packet reception should begin shortly
   // Skip transmitting on this slot
@@ -875,6 +894,11 @@ static void CheckConfigChangePending()
 
 bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 {
+  if (TxTakeover::IsSniffState())
+  {
+    return TxTakeover::OnRxDone(status);
+  }
+
   // busyTransmitting is required here to prevent accidental rxdone IRQs due to interference triggering RXdoneISR.
   if (LQCalc.currentIsSet() || busyTransmitting)
   {
@@ -902,6 +926,7 @@ void ICACHE_RAM_ATTR TXdoneISR()
   if (connectionState != awaitingModelId)
   {
     HandleFHSS();
+    TxTakeover::OnTxDone();
     HandlePrepareForTLM();
 #if defined(Regulatory_Domain_EU_CE_2400)
     if (TelemetryRcvPhase != ttrpPreReceiveGap)
@@ -1484,6 +1509,8 @@ void setup()
   #endif
       hwTimer::init(nullptr, timerCallback);
       connectionState = noCrossfire;
+
+      TxTakeover::Init();
     }
   }
   else
@@ -1512,6 +1539,7 @@ void setup()
 void loop()
 {
   uint32_t now = millis();
+  TxTakeover::Update(now);
 
   HandleUARTout(); // Only used for non-CRSF output
 

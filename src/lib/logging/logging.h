@@ -27,7 +27,10 @@
 
 #if defined(TARGET_TX)
 extern Stream *TxBackpack;
-#if defined(PLATFORM_ESP32_S3)
+extern Stream *TxUSB;
+#if defined(LOGGING_UART_TXUSB)
+#define LOGGING_UART (*(TxUSB != nullptr ? TxUSB : (TxBackpack != nullptr ? TxBackpack : (Stream *)&Serial)))
+#elif defined(PLATFORM_ESP32_S3)
 #define LOGGING_UART (Serial)
 #else
 #define LOGGING_UART (*TxBackpack)
