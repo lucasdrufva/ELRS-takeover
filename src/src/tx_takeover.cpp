@@ -6,6 +6,9 @@ extern TxConfig config;
 extern volatile bool busyTransmitting;
 extern TxTlmRcvPhase_e TelemetryRcvPhase;
 extern volatile uint32_t LastTLMpacketRecvMillis;
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+extern bool webserverPreventAutoStart;
+#endif
 
 void SetRFLinkRate(uint8_t index);
 
@@ -50,7 +53,7 @@ struct RecoveryPoint
 };
 
 static constexpr uint8_t UID_LOCK_COUNT = 3;
-static constexpr uint8_t RECOVERY_MIN_POINTS = 4;
+static constexpr uint8_t RECOVERY_MIN_POINTS = 3;
 static constexpr uint8_t RECOVERY_SWITCH_TO_ALT_REF_POINTS = 8;
 static constexpr uint8_t RECOVERY_POINTS_PER_REFERENCE = 4;
 static constexpr uint8_t RECOVERY_MAX_POINTS = 24;
@@ -58,6 +61,7 @@ static constexpr uint8_t RECOVERY_REJECT_LIMIT = 10;
 static constexpr uint32_t RATE_SCAN_DWELL_MS = 1200;
 static constexpr uint32_t RECOVER_SYNC_TIMEOUT_MS = 1500;
 static constexpr uint32_t RECOVER_REFERENCE_TIMEOUT_MS = 300;
+static constexpr uint32_t SYNC_WAIT_GUARD_MS = 300;
 static constexpr uint32_t WAIT_HOP_TIMEOUT_MS = 1000;
 static constexpr uint32_t POST_TAKEOVER_STABILIZE_MS = 2200;
 static constexpr uint32_t POST_TAKEOVER_LOSS_MS = 1800;
@@ -89,6 +93,7 @@ static volatile uint8_t g_recoveryReferenceSwitchCount = 0;
 static volatile uint8_t g_recoveryNextReferenceSwitchAtPoints = RECOVERY_SWITCH_TO_ALT_REF_POINTS;
 static volatile uint8_t g_uidLockCount = 0;
 static volatile bool g_scanAltIq = false;
+static volatile bool g_takeoverStartPending = false;
 
 static volatile uint16_t g_sniffIrqOk = 0;
 static volatile uint16_t g_sniffIrqErr = 0;
@@ -108,6 +113,48 @@ static RecoveryPoint g_recoveryPoints[RECOVERY_MAX_POINTS] = {};
 static bool g_recoveryReferenceChannelUsed[FHSS_SEQUENCE_LEN] = {false};
 static SyncObservation g_lastSync = {};
 static uint32_t g_sniffStatsLastLogMs = 0;
+
+static uint8_t getCurrentRateIndexForSyncWait()
+{
+    if (ExpressLRS_currAirRate_Modparams != nullptr)
+    {
+        return ExpressLRS_currAirRate_Modparams->index;
+    }
+
+    if (g_scanRateCount > 0)
+    {
+        return g_scanRates[g_scanRatePos % g_scanRateCount];
+    }
+
+    return 0;
+}
+
+static uint32_t computeSyncWaitTimeoutMs(uint8_t rateIndex, uint32_t minimumMs)
+{
+    uint32_t timeoutMs = minimumMs;
+    expresslrs_rf_pref_params_s const *const rfPerf = get_elrs_RFperfParams(rateIndex);
+    if (rfPerf != nullptr)
+    {
+        uint32_t syncIntervalMs = rfPerf->SyncPktIntervalDisconnected;
+        if (rfPerf->SyncPktIntervalConnected > syncIntervalMs)
+        {
+            syncIntervalMs = rfPerf->SyncPktIntervalConnected;
+        }
+
+        syncIntervalMs += SYNC_WAIT_GUARD_MS;
+        if (syncIntervalMs > timeoutMs)
+        {
+            timeoutMs = syncIntervalMs;
+        }
+    }
+
+    return timeoutMs;
+}
+
+static uint32_t computeCurrentRateSyncWaitTimeoutMs(uint32_t minimumMs)
+{
+    return computeSyncWaitTimeoutMs(getCurrentRateIndexForSyncWait(), minimumMs);
+}
 
 static inline OTA_Sync_s const *getSyncPacket(OTA_Packet_s *pkt)
 {
@@ -262,6 +309,7 @@ static void beginRetryBackoff(char const *reason)
     g_recoveryRejectedPoints = 0;
     g_recoveryReferenceSwitchCount = 0;
     g_recoveryNextReferenceSwitchAtPoints = RECOVERY_SWITCH_TO_ALT_REF_POINTS;
+    g_takeoverStartPending = false;
     g_mirrorCompatSync = false;
     g_lastSync.valid = false;
     g_sniffIrqOk = 0;
@@ -365,16 +413,18 @@ static uint16_t calcStdPacketCrcForTakeover(OTA_Packet_s *pkt, uint8_t crcHighFo
     return calc;
 }
 
-static bool validateTakeoverPacketCrc(OTA_Packet_s *pkt)
+// Returns matched nonceMod (0..hopInterval-1) for wide-mode packets, or -1 if
+// nonceMod could not be determined (non-wide, full-res, or validation failure).
+static int8_t validateTakeoverPacketCrcEx(OTA_Packet_s *pkt)
 {
     if (pkt == nullptr)
     {
-        return false;
+        return -2;
     }
 
     if (OtaIsFullRes)
     {
-        return OtaValidatePacketCrc(pkt);
+        return OtaValidatePacketCrc(pkt) ? -1 : -2;
     }
 
     bool const isWideRcPacket =
@@ -385,14 +435,14 @@ static bool validateTakeoverPacketCrc(OTA_Packet_s *pkt)
 
     if (!isWideRcPacket)
     {
-        return OtaValidatePacketCrc(pkt);
+        return OtaValidatePacketCrc(pkt) ? -1 : -2;
     }
 
     uint16_t const inCRC = ((uint16_t)pkt->std.crcHigh << 8) | pkt->std.crcLow;
     uint8_t const hopInterval = ExpressLRS_currAirRate_Modparams->FHSShopInterval;
     if (hopInterval == 0)
     {
-        return false;
+        return -2;
     }
 
     for (uint8_t nonceMod = 0; nonceMod < hopInterval; nonceMod++)
@@ -400,14 +450,19 @@ static bool validateTakeoverPacketCrc(OTA_Packet_s *pkt)
         uint8_t const injectedCrcHigh = nonceMod + 1;
         if (calcStdPacketCrcForTakeover(pkt, injectedCrcHigh) == inCRC)
         {
-            return true;
+            return (int8_t)nonceMod;
         }
     }
 
-    return false;
+    return -2;
 }
 
-static bool resolveSyncUidTailAndCheckCrc(OTA_Packet_s *pkt, OTA_Sync_s const *sync, uint8_t *resolvedUid5, uint8_t *resolvedModelXor)
+static bool validateTakeoverPacketCrc(OTA_Packet_s *pkt)
+{
+    return validateTakeoverPacketCrcEx(pkt) >= -1;
+}
+
+static bool resolveSyncUidTailAndCheckCrc(OTA_Packet_s *pkt, OTA_Sync_s const *sync, uint8_t *resolvedUid5)
 {
     if (pkt == nullptr || sync == nullptr || resolvedUid5 == nullptr)
     {
@@ -418,26 +473,19 @@ static bool resolveSyncUidTailAndCheckCrc(OTA_Packet_s *pkt, OTA_Sync_s const *s
     uint8_t const prevUid5 = UID[5];
 
     UID[4] = sync->UID4;
-    for (uint8_t modelXor = 0; modelXor <= MODELMATCH_MASK; modelXor++)
+    UID[5] = sync->UID5;
+    OtaUpdateCrcInitFromUid();
+
+    if (!validateTakeoverPacketCrc(pkt))
     {
-        uint8_t const candidateUid5 = sync->UID5 ^ modelXor;
-        UID[5] = candidateUid5;
+        UID[4] = prevUid4;
+        UID[5] = prevUid5;
         OtaUpdateCrcInitFromUid();
-        if (validateTakeoverPacketCrc(pkt))
-        {
-            *resolvedUid5 = candidateUid5;
-            if (resolvedModelXor != nullptr)
-            {
-                *resolvedModelXor = modelXor;
-            }
-            return true;
-        }
+        return false;
     }
 
-    UID[4] = prevUid4;
-    UID[5] = prevUid5;
-    OtaUpdateCrcInitFromUid();
-    return false;
+    *resolvedUid5 = sync->UID5;
+    return true;
 }
 
 static void emitSniffStats(uint32_t nowMs)
@@ -476,8 +524,9 @@ static void startUid2Recovery()
     g_recoveryRejectedPoints = 0;
     g_recoveryReferenceSwitchCount = 0;
     g_recoveryNextReferenceSwitchAtPoints = RECOVERY_SWITCH_TO_ALT_REF_POINTS;
+    g_takeoverStartPending = false;
     g_havePendingRecoverySync = false;
-    g_stateDeadlineMs = millis() + RECOVER_SYNC_TIMEOUT_MS;
+    g_stateDeadlineMs = millis() + computeCurrentRateSyncWaitTimeoutMs(RECOVER_SYNC_TIMEOUT_MS);
 
     const uint32_t channelCount = FHSSgetChannelCount();
     uint_fast8_t const activeSyncChannel = getActiveSyncChannel();
@@ -571,7 +620,7 @@ static void resetUidRecoveryToWaitSync(uint32_t nowMs)
 {
     g_havePendingRecoverySync = false;
     g_recoverSubState = RECOVER_WAIT_SYNC;
-    g_stateDeadlineMs = nowMs + RECOVER_SYNC_TIMEOUT_MS;
+    g_stateDeadlineMs = nowMs + computeCurrentRateSyncWaitTimeoutMs(RECOVER_SYNC_TIMEOUT_MS);
     setRadioSyncListen();
 }
 
@@ -659,7 +708,7 @@ static int16_t distanceFromSyncToChannel(uint8_t const *sequence, uint16_t seque
     return -1;
 }
 
-static bool sequenceMatchesPoints(uint8_t const *sequence, uint16_t sequenceCount, uint_fast8_t syncChannel)
+static bool sequenceMatchesPoints(uint8_t const *sequence, uint16_t sequenceCount, uint_fast8_t syncChannel, uint8_t tolerance)
 {
     for (uint8_t idx = 0; idx < g_recoveryPointCount; idx++)
     {
@@ -670,7 +719,13 @@ static bool sequenceMatchesPoints(uint8_t const *sequence, uint16_t sequenceCoun
         }
 
         int16_t distance = distanceFromSyncToChannel(sequence, sequenceCount, startIndex, g_recoveryPoints[idx].referenceChannel);
-        if (distance < 0 || (uint8_t)distance != g_recoveryPoints[idx].distanceHops)
+        if (distance < 0)
+        {
+            return false;
+        }
+        int16_t diff = distance - (int16_t)g_recoveryPoints[idx].distanceHops;
+        if (diff < 0) diff = -diff;
+        if (diff > (int16_t)tolerance)
         {
             return false;
         }
@@ -679,7 +734,7 @@ static bool sequenceMatchesPoints(uint8_t const *sequence, uint16_t sequenceCoun
     return true;
 }
 
-static uint8_t countUid2Matches(uint8_t *matchedUid2)
+static uint8_t countUid2MatchesWithTolerance(uint8_t *matchedUid2, uint8_t tolerance)
 {
     const uint32_t freqCount = FHSSgetChannelCount();
     const uint16_t sequenceCount = FHSSgetSequenceCount();
@@ -700,7 +755,7 @@ static uint8_t countUid2Matches(uint8_t *matchedUid2)
                                  ((uint32_t)UID[4] << 8) + (UID[5] ^ OTA_VERSION_ID);
         buildSequenceForSeed(candidateSeed, freqCount, activeSyncChannel, sequenceCount, candidateSequence);
 
-        if (!sequenceMatchesPoints(candidateSequence, sequenceCount, activeSyncChannel))
+        if (!sequenceMatchesPoints(candidateSequence, sequenceCount, activeSyncChannel, tolerance))
         {
             continue;
         }
@@ -732,7 +787,20 @@ static uint8_t countUid2Matches(uint8_t *matchedUid2)
     return matches;
 }
 
-static RecoveryPointStatus addRecoveryPoint(uint32_t nowUs, uint8_t *distanceHopsOut, uint32_t *elapsedUsOut)
+static uint8_t countUid2Matches(uint8_t *matchedUid2)
+{
+    // Try exact matching first
+    uint8_t count = countUid2MatchesWithTolerance(matchedUid2, 0);
+    if (count > 0)
+    {
+        return count;
+    }
+    // Fall back to ±1 hop tolerance for timing-edge cases
+    return countUid2MatchesWithTolerance(matchedUid2, 1);
+}
+
+// refNonceMod: nonceMod extracted from wide-mode CRC (>=0), or -1 if unknown
+static RecoveryPointStatus addRecoveryPoint(uint32_t nowUs, int8_t refNonceMod, uint8_t *distanceHopsOut, uint32_t *elapsedUsOut)
 {
     if (!g_havePendingRecoverySync || ExpressLRS_currAirRate_Modparams == nullptr)
     {
@@ -752,16 +820,51 @@ static RecoveryPointStatus addRecoveryPoint(uint32_t nowUs, uint8_t *distanceHop
     {
         *elapsedUsOut = elapsedUs;
     }
-    const uint8_t nonceMod = g_pendingSyncNonce % hopInterval;
-    const uint32_t toNextHopUs = (uint32_t)(hopInterval - nonceMod) * packetIntervalUs;
+    const uint8_t syncNonceMod = g_pendingSyncNonce % hopInterval;
+    const uint32_t toNextHopUs = (uint32_t)(hopInterval - syncNonceMod) * packetIntervalUs;
     if (elapsedUs < toNextHopUs)
     {
         return RecoveryPointNotReady;
     }
 
     const uint32_t hopDurationUs = packetIntervalUs * hopInterval;
-    const uint32_t adjustedUs = elapsedUs - toNextHopUs;
-    const uint32_t distanceHops = (adjustedUs + hopDurationUs / 2U) / hopDurationUs;
+    uint32_t distanceHops;
+
+    if (refNonceMod >= 0)
+    {
+        // Wide mode: use nonceMod from CRC for precise hop distance.
+        // Compute approximate delta-nonce from timing, then snap to
+        // the exact value consistent with the known nonceMod.
+        uint32_t approxDeltaNonce = (elapsedUs + packetIntervalUs / 2U) / packetIntervalUs;
+        uint32_t receivedNonce = (uint32_t)g_pendingSyncNonce + approxDeltaNonce;
+        // Snap to nearest nonce that satisfies receivedNonce % hopInterval == refNonceMod
+        uint8_t currentMod = receivedNonce % hopInterval;
+        int8_t correction = (int8_t)refNonceMod - (int8_t)currentMod;
+        if (correction > (int8_t)(hopInterval / 2))
+        {
+            correction -= hopInterval;
+        }
+        else if (correction < -(int8_t)(hopInterval / 2))
+        {
+            correction += hopInterval;
+        }
+        receivedNonce = (uint32_t)((int32_t)receivedNonce + correction);
+        if (receivedNonce <= g_pendingSyncNonce)
+        {
+            return RecoveryPointNotReady;
+        }
+        // Compute exact hop count from nonce values
+        uint32_t syncHopSlot = g_pendingSyncNonce / hopInterval;
+        uint32_t refHopSlot = receivedNonce / hopInterval;
+        distanceHops = refHopSlot - syncHopSlot;
+    }
+    else
+    {
+        // Non-wide mode: use rounded timing quantization.
+        const uint32_t adjustedUs = elapsedUs - toNextHopUs;
+        distanceHops = (adjustedUs + hopDurationUs / 2U) / hopDurationUs;
+    }
+
     if (distanceHopsOut != nullptr)
     {
         *distanceHopsOut = (uint8_t)distanceHops;
@@ -886,39 +989,45 @@ static bool processSyncLockPacket(OTA_Packet_s *pkt)
     }
 
     OTA_Sync_s const *const sync = getSyncPacket(pkt);
-    if (sync->rateIndex != ExpressLRS_currAirRate_Modparams->index)
-    {
-        g_sniffRateMismatch++;
-        Radio.RXnb();
-        return false;
-    }
-
+    bool const hadPreviousSync = g_lastSync.valid;
+    uint8_t const prevResolvedUid5 = UID[5];
     uint8_t resolvedUid5 = 0;
-    uint8_t resolvedModelXor = 0;
-    if (!resolveSyncUidTailAndCheckCrc(pkt, sync, &resolvedUid5, &resolvedModelXor))
+    if (!resolveSyncUidTailAndCheckCrc(pkt, sync, &resolvedUid5))
     {
         g_sniffCrcFail++;
         Radio.RXnb();
         return false;
     }
     g_sniffCrcOk++;
+
+    if (sync->rateIndex != ExpressLRS_currAirRate_Modparams->index)
+    {
+        g_sniffRateMismatch++;
+        if (g_uidLockCount == 0)
+        {
+            DBGLN("Takeover sync CRC-ok rate mismatch scan=%u packet=%u",
+                  ExpressLRS_currAirRate_Modparams->index, sync->rateIndex);
+        }
+        if (!shouldScanRate(sync->rateIndex))
+        {
+            Radio.RXnb();
+            return false;
+        }
+    }
+
     UID[3] = sync->UID3;
     UID[4] = sync->UID4;
     UID[5] = resolvedUid5;
-    if (resolvedModelXor != 0 && g_uidLockCount == 0)
-    {
-        DBGLN("Takeover model match XOR=%u", resolvedModelXor);
-    }
 
-    bool const hadPreviousSync = g_lastSync.valid;
     uint8_t const prevUid3 = g_lastSync.uid3;
     uint8_t const prevUid4 = g_lastSync.uid4;
     uint8_t const prevUid5 = g_lastSync.uid5Wire;
 
     captureSync(sync, micros());
 
-    if (!hadPreviousSync ||
-        (prevUid3 == sync->UID3 && prevUid4 == sync->UID4 && prevUid5 == sync->UID5))
+    bool const sameWireTail = prevUid3 == sync->UID3 && prevUid4 == sync->UID4 && prevUid5 == sync->UID5;
+    bool const sameResolvedTail = prevResolvedUid5 == resolvedUid5;
+    if (!hadPreviousSync || (sameWireTail && sameResolvedTail))
     {
         g_uidLockCount++;
     }
@@ -927,7 +1036,8 @@ static bool processSyncLockPacket(OTA_Packet_s *pkt)
         g_uidLockCount = 1;
     }
 
-    g_stateDeadlineMs = millis() + RATE_SCAN_DWELL_MS;
+    uint8_t const deadlineRate = shouldScanRate(sync->rateIndex) ? sync->rateIndex : ExpressLRS_currAirRate_Modparams->index;
+    g_stateDeadlineMs = millis() + computeSyncWaitTimeoutMs(deadlineRate, RATE_SCAN_DWELL_MS);
 
     if (g_uidLockCount >= UID_LOCK_COUNT)
     {
@@ -942,6 +1052,11 @@ static bool processSyncLockPacket(OTA_Packet_s *pkt)
 
 static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
 {
+    if (g_takeoverStartPending)
+    {
+        return false;
+    }
+
     if (g_recoverSubState == RECOVER_WAIT_SYNC)
     {
         if (pkt->std.type != PACKET_TYPE_SYNC)
@@ -951,11 +1066,32 @@ static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
         }
 
         OTA_Sync_s const *const sync = getSyncPacket(pkt);
+        if (g_lastSync.valid &&
+            (sync->UID3 != g_lastSync.uid3 ||
+             sync->UID4 != g_lastSync.uid4 ||
+             sync->UID5 != g_lastSync.uid5Wire))
+        {
+            // Ignore sync-like packets that don't match the locked UID tail.
+            Radio.RXnb();
+            return false;
+        }
+        if (g_lastSync.valid && sync->rateIndex != g_lastSync.rateIndex)
+        {
+            // Recovery sync anchors must remain on the locked rate.
+            Radio.RXnb();
+            return false;
+        }
 
         uint8_t resolvedUid5 = 0;
-        if (!resolveSyncUidTailAndCheckCrc(pkt, sync, &resolvedUid5, nullptr))
+        if (!resolveSyncUidTailAndCheckCrc(pkt, sync, &resolvedUid5))
         {
             g_sniffCrcFail++;
+            Radio.RXnb();
+            return false;
+        }
+        if (UID[5] != resolvedUid5)
+        {
+            // Keep the previously locked UID5.
             Radio.RXnb();
             return false;
         }
@@ -976,7 +1112,16 @@ static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
         return true;
     }
 
-    if (!validateTakeoverPacketCrc(pkt))
+    if (pkt->std.type != PACKET_TYPE_RCDATA && pkt->std.type != PACKET_TYPE_MSPDATA)
+    {
+        // Use only uplink packets as reference points. Downlink telemetry/sync-like
+        // packets can skew elapsed timing and poison UID2 constraints.
+        Radio.RXnb();
+        return false;
+    }
+
+    int8_t const refNonceMod = validateTakeoverPacketCrcEx(pkt);
+    if (refNonceMod == -2)
     {
         g_sniffCrcFail++;
         Radio.RXnb();
@@ -986,7 +1131,7 @@ static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
 
     uint8_t measuredDistanceHops = 0;
     uint32_t elapsedUs = 0;
-    RecoveryPointStatus const pointStatus = addRecoveryPoint(micros(), &measuredDistanceHops, &elapsedUs);
+    RecoveryPointStatus const pointStatus = addRecoveryPoint(micros(), refNonceMod, &measuredDistanceHops, &elapsedUs);
 
     if (pointStatus == RecoveryPointNotReady)
     {
@@ -1008,8 +1153,8 @@ static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
         return true;
     }
 
-    DBGLN("Takeover UID2 point ref=%u idx=%u dist=%u points=%u elapsedUs=%u",
-          g_referenceChannel, g_pendingSyncIndex, measuredDistanceHops, g_recoveryPointCount, (unsigned)elapsedUs);
+    DBGLN("Takeover UID2 point ref=%u idx=%u dist=%u points=%u elapsedUs=%u nonceMod=%d",
+          g_referenceChannel, g_pendingSyncIndex, measuredDistanceHops, g_recoveryPointCount, (unsigned)elapsedUs, (int)refNonceMod);
 
     if (g_recoveryPointCount < RECOVERY_MIN_POINTS)
     {
@@ -1022,7 +1167,7 @@ static bool processUidRecoveryPacket(OTA_Packet_s *pkt)
     {
         UID[2] = recoveredUid2;
         DBGLN("Takeover recovered UID2=%u", UID[2]);
-        startTakeoverAttempt();
+        g_takeoverStartPending = true;
         return true;
     }
 
@@ -1073,6 +1218,10 @@ void Init()
     }
 
     g_initialized = true;
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+    // Keep auto-WiFi from interrupting takeover while UID2 recovery is running.
+    webserverPreventAutoStart = true;
+#endif
     buildScanRateOrder();
     if (g_scanRateCount == 0)
     {
@@ -1109,6 +1258,12 @@ void Update(uint32_t nowMs)
         break;
 
     case RECOVER_UID2:
+        if (g_takeoverStartPending)
+        {
+            g_takeoverStartPending = false;
+            startTakeoverAttempt();
+            break;
+        }
         emitSniffStats(nowMs);
         if ((int32_t)(nowMs - g_stateDeadlineMs) >= 0)
         {
