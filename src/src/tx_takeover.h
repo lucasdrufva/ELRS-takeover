@@ -11,7 +11,7 @@
 #endif
 
 #ifndef TAKEOVER_SYNC_BURST
-#define TAKEOVER_SYNC_BURST 4
+#define TAKEOVER_SYNC_BURST 8
 #endif
 
 namespace TxTakeover

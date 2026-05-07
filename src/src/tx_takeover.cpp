@@ -63,9 +63,9 @@ static constexpr uint32_t RECOVER_SYNC_TIMEOUT_MS = 1500;
 static constexpr uint32_t RECOVER_REFERENCE_TIMEOUT_MS = 300;
 static constexpr uint32_t SYNC_WAIT_GUARD_MS = 300;
 static constexpr uint32_t WAIT_HOP_TIMEOUT_MS = 1000;
-static constexpr uint32_t POST_TAKEOVER_STABILIZE_MS = 2200;
-static constexpr uint32_t POST_TAKEOVER_LOSS_MS = 1800;
-static constexpr uint32_t MIRROR_COMPAT_MS = 2000;
+static constexpr uint32_t POST_TAKEOVER_STABILIZE_MS = 4000;
+static constexpr uint32_t POST_TAKEOVER_LOSS_MS = 5000;
+static constexpr uint32_t MIRROR_COMPAT_MS = 5000;
 static constexpr uint32_t RETRY_BACKOFF_BASE_MS = 400;
 static constexpr uint32_t RETRY_BACKOFF_STEP_MS = 350;
 static constexpr uint32_t RETRY_BACKOFF_MAX_MS = 4000;
@@ -94,6 +94,7 @@ static volatile uint8_t g_recoveryNextReferenceSwitchAtPoints = RECOVERY_SWITCH_
 static volatile uint8_t g_uidLockCount = 0;
 static volatile bool g_scanAltIq = false;
 static volatile bool g_takeoverStartPending = false;
+static uint8_t g_computedFhssOffset = TAKEOVER_FHSS_OFFSET;
 
 static volatile uint16_t g_sniffIrqOk = 0;
 static volatile uint16_t g_sniffIrqErr = 0;
@@ -688,6 +689,42 @@ static void buildSequenceForSeed(uint32_t seed, uint32_t freqCount, uint_fast8_t
     }
 }
 
+// Compute the FHSS offset that minimizes channel collisions between the
+// original TX (at position i) and the takeover TX (at position i+offset).
+// Returns the best offset in [1, sequenceCount-1].
+static uint8_t computeOptimalFhssOffset(uint8_t const *sequence, uint16_t sequenceCount)
+{
+    if (sequenceCount <= 2)
+    {
+        return 1;
+    }
+
+    uint8_t bestOffset = TAKEOVER_FHSS_OFFSET;
+    uint16_t bestCollisions = sequenceCount; // worst case
+
+    for (uint16_t offset = 1; offset < sequenceCount; offset++)
+    {
+        uint16_t collisions = 0;
+        for (uint16_t i = 0; i < sequenceCount; i++)
+        {
+            if (sequence[i] == sequence[(i + offset) % sequenceCount])
+            {
+                collisions++;
+            }
+        }
+        if (collisions < bestCollisions)
+        {
+            bestCollisions = collisions;
+            bestOffset = (uint8_t)offset;
+        }
+    }
+
+    DBGLN("Takeover optimal FHSS offset=%u collisions=%u/%u (%.1f%%)",
+          bestOffset, bestCollisions, sequenceCount,
+          (float)bestCollisions * 100.0f / sequenceCount);
+    return bestOffset;
+}
+
 static int16_t distanceFromSyncToChannel(uint8_t const *sequence, uint16_t sequenceCount, uint16_t startIndex, uint8_t targetChannel)
 {
     if (sequenceCount == 0)
@@ -936,6 +973,9 @@ static void startTakeoverAttempt()
     restoreRateRxTimeout();
 
     const uint16_t sequenceCount = FHSSgetSequenceCount();
+
+    // Compute optimal offset to minimize frequency collisions with original TX
+    g_computedFhssOffset = computeOptimalFhssOffset(FHSSsequence, sequenceCount);
     const uint8_t hopInterval = ExpressLRS_currAirRate_Modparams->FHSShopInterval;
     const uint32_t packetIntervalUs = ExpressLRS_currAirRate_Modparams->interval;
     if (sequenceCount == 0 || hopInterval == 0 || packetIntervalUs == 0)
@@ -1422,7 +1462,7 @@ void ICACHE_RAM_ATTR OverrideSyncFields(OTA_Sync_s *syncPtr, bool forcedBurst)
         uint16_t const sequenceCount = FHSSgetSequenceCount();
         if (sequenceCount > 0)
         {
-            syncPtr->fhssIndex = (uint8_t)((FHSSgetCurrIndex() + TAKEOVER_FHSS_OFFSET) % sequenceCount);
+            syncPtr->fhssIndex = (uint8_t)((FHSSgetCurrIndex() + g_computedFhssOffset) % sequenceCount);
         }
     }
 }
@@ -1449,7 +1489,7 @@ void ICACHE_RAM_ATTR OnTxDone()
     }
 
     g_pendingIndexShift = false;
-    FHSSsetCurrIndex((uint8_t)(FHSSgetCurrIndex() + TAKEOVER_FHSS_OFFSET));
+    FHSSsetCurrIndex((uint8_t)(FHSSgetCurrIndex() + g_computedFhssOffset));
     setRadioToCurrentTxFrequency();
 
     g_state = TX_OFFSET_NORMAL;
@@ -1459,7 +1499,7 @@ void ICACHE_RAM_ATTR OnTxDone()
     g_mirrorCompatSync = true;
     g_mirrorCompatUntilMs = g_takeoverNormalStartMs + MIRROR_COMPAT_MS;
 
-    DBGLN("Takeover burst complete; applied FHSS offset %u", (uint8_t)TAKEOVER_FHSS_OFFSET);
+    DBGLN("Takeover burst complete; applied FHSS offset %u", g_computedFhssOffset);
 }
 } // namespace TxTakeover
 
